@@ -1,0 +1,56 @@
+IBM Daily Stock Prices — Alpha Vantage
+Version: 1.0
+Source: Alpha Vantage API — Time Series Daily endpoint
+Symbol: IBM (International Business Machines)
+Data Range: 2025-12-26 to 2026-05-20
+Record Count: 100 trading days
+
+Overview
+This database stores daily OHLCV (Open, High, Low, Close, Volume) price data for IBM stock sourced from the Alpha Vantage API. The schema is designed to support multi-symbol expansion, API metadata tracking, and derived analytics, while keeping raw price data normalized and auditable.
+
+Table Definitions
+1. symbols
+Stores the master list of tracked stock ticker symbols.
+ColumnTypeConstraintsDescriptionsymbol_idSERIALPRIMARY KEYSurrogate keytickerVARCHAR(10)UNIQUE NOT NULLExchange ticker symbol (e.g., IBM)company_nameVARCHAR(255)NOT NULLFull company nameexchangeVARCHAR(50)Exchange listing (e.g., NYSE)currencyCHAR(3)DEFAULT 'USD'ISO 4217 currency codecreated_atTIMESTAMPTZDEFAULT NOW()Record creation timestamp
+Notes: The ticker column is the natural business key. symbol_id is used in all foreign key references to avoid brittle string joins.
+
+2. api_ingestion_runs
+Audit table tracking each data pull from the Alpha Vantage API.
+ColumnTypeConstraintsDescriptionrun_idSERIALPRIMARY KEYSurrogate keysymbol_idINTEGERFK → symbols(symbol_id)Symbol fetchedfetched_atTIMESTAMPTZDEFAULT NOW()When the API call was maderecords_insertedINTEGERCount of rows written in this runsource_urlTEXTFull API endpoint URL usedstatusVARCHAR(20)DEFAULT 'success'success, partial, failednotesTEXTAny warnings or error messages
+Notes: Every load script execution creates one row here. This enables reproducible data lineage and debugging of data gaps.
+
+3. daily_prices
+Core fact table. One row per symbol per trading day.
+ColumnTypeConstraintsDescriptionprice_idBIGSERIALPRIMARY KEYSurrogate keysymbol_idINTEGERFK → symbols(symbol_id) NOT NULLLink to tickerrun_idINTEGERFK → api_ingestion_runs(run_id)Source ingestion runtrade_dateDATENOT NULLTrading date (market calendar)open_priceNUMERIC(12, 4)NOT NULL CHECK (> 0)Opening pricehigh_priceNUMERIC(12, 4)NOT NULL CHECK (> 0)Intraday highlow_priceNUMERIC(12, 4)NOT NULL CHECK (> 0)Intraday lowclose_priceNUMERIC(12, 4)NOT NULL CHECK (> 0)Closing pricevolumeBIGINTNOT NULL CHECK (>= 0)Shares tradedingested_atTIMESTAMPTZDEFAULT NOW()Row insert timestamp
+Unique Constraint: UNIQUE(symbol_id, trade_date) — prevents duplicate entries for the same symbol on the same day.
+Check Constraints:
+
+high_price >= low_price
+high_price >= open_price
+high_price >= close_price
+low_price <= open_price
+low_price <= close_price
+
+
+4. daily_price_metrics (derived / materialized)
+Computed analytics layer. Populated by a scheduled job or refresh trigger after new prices load.
+ColumnTypeDescriptionmetric_idBIGSERIALPRIMARY KEYsymbol_idINTEGERFK → symbols(symbol_id)trade_dateDATEdaily_return_pctNUMERIC(8, 4)((close - prev_close) / prev_close) * 100price_rangeNUMERIC(12, 4)high - lowrange_pctNUMERIC(8, 4)((high - low) / low) * 100vwap_approxNUMERIC(12, 4)(high + low + close) / 3 (simplified HLC/3)20d_smaNUMERIC(12, 4)20-day simple moving average of closecomputed_atTIMESTAMPTZWhen metrics were last computed
+Notes: This table is intentionally separated from daily_prices to keep raw data immutable. Analytics can be recomputed without touching source records.
+
+Indexes
+Index NameTableColumnsTypePurposeidx_dp_symbol_datedaily_prices(symbol_id, trade_date DESC)BTREEPrimary time-series query patternidx_dp_trade_datedaily_pricestrade_dateBTREECross-symbol date range queriesidx_dp_volumedaily_pricesvolumeBTREEVolume screening queriesidx_symbols_tickersymbolstickerBTREELookup by ticker stringidx_run_symbolapi_ingestion_runs(symbol_id, fetched_at DESC)BTREEAudit queries per symbol
+
+Relationships Summary
+RelationshipCardinalityDescriptionsymbols → daily_prices1 : ManyOne symbol has many daily price recordssymbols → api_ingestion_runs1 : ManyOne symbol has many ingestion run recordsapi_ingestion_runs → daily_prices1 : ManyOne run inserts many price rowssymbols → daily_price_metrics1 : ManyOne symbol has many metric records
+
+Data Type Rationale
+ChoiceReasonNUMERIC(12, 4) for pricesExact decimal arithmetic; avoids floating-point rounding errors in financial dataBIGINT for volumeIBM regularly exceeds 10M shares/day; INT max (2.1B) is sufficient but BIGINT is safer at scaleDATE for trade_dateNo time component needed; market opens at 09:30 ET but Alpha Vantage daily endpoint returns date onlyTIMESTAMPTZ for audit fieldsPreserves timezone context for data pipeline debugging
+
+Constraints & Business Rules
+
+No duplicate (symbol, date) pairs in daily_prices.
+high_price must be ≥ all other price columns for the same row.
+low_price must be ≤ all other price columns for the same row.
+All price values must be positive.
+Volume must be non-negative (zero is valid on scheduled non-trading days if included).
+Every price row must reference a valid symbol_id (enforced by FK).
