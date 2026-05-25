@@ -1,0 +1,306 @@
+-- IBM Daily Stock Prices — PostgreSQL Initial Load Script
+-- Source: Alpha Vantage (daily_IBM.csv)
+-- =============================================================================
+-- USAGE:
+--   psql -U <user> -d <database> -f ibm_load_script.sql
+--
+-- PREREQUISITES:
+--   1. A PostgreSQL 14+ database with CREATE TABLE privileges.
+--   2. The CSV file accessible at the path used in the COPY command,
+--      OR use \copy (psql client-side) if the file is on your local machine.
+-- =============================================================================
+ 
+-- -------------------------
+-- 0. SETUP
+-- -------------------------
+BEGIN;
+ 
+SET client_encoding = 'UTF8';
+SET datestyle = 'ISO, MDY';
+ 
+-- -------------------------
+-- 1. CREATE TABLES
+-- -------------------------
+ 
+-- 1a. Symbols master table
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol_id    SERIAL        PRIMARY KEY,
+    ticker       VARCHAR(10)   NOT NULL UNIQUE,
+    company_name VARCHAR(255)  NOT NULL,
+    exchange     VARCHAR(50),
+    currency     CHAR(3)       NOT NULL DEFAULT 'USD',
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+ 
+-- 1b. API ingestion audit log
+CREATE TABLE IF NOT EXISTS api_ingestion_runs (
+    run_id           SERIAL       PRIMARY KEY,
+    symbol_id        INTEGER      NOT NULL REFERENCES symbols(symbol_id) ON DELETE RESTRICT,
+    fetched_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    records_inserted INTEGER,
+    source_url       TEXT,
+    status           VARCHAR(20)  NOT NULL DEFAULT 'success'
+                     CHECK (status IN ('success', 'partial', 'failed')),
+    notes            TEXT
+);
+ 
+-- 1c. Core daily prices fact table
+CREATE TABLE IF NOT EXISTS daily_prices (
+    price_id      BIGSERIAL    PRIMARY KEY,
+    symbol_id     INTEGER      NOT NULL REFERENCES symbols(symbol_id) ON DELETE RESTRICT,
+    run_id        INTEGER      REFERENCES api_ingestion_runs(run_id) ON DELETE SET NULL,
+    trade_date    DATE         NOT NULL,
+    open_price    NUMERIC(12,4) NOT NULL,
+    high_price    NUMERIC(12,4) NOT NULL,
+    low_price     NUMERIC(12,4) NOT NULL,
+    close_price   NUMERIC(12,4) NOT NULL,
+    volume        BIGINT        NOT NULL,
+    ingested_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+ 
+    -- Prevent duplicate rows for same symbol+date
+    CONSTRAINT uq_symbol_date UNIQUE (symbol_id, trade_date),
+ 
+    -- OHLC sanity checks
+    CONSTRAINT chk_prices_positive
+        CHECK (open_price > 0 AND high_price > 0 AND low_price > 0 AND close_price > 0),
+    CONSTRAINT chk_high_is_max
+        CHECK (high_price >= open_price
+           AND high_price >= close_price
+           AND high_price >= low_price),
+    CONSTRAINT chk_low_is_min
+        CHECK (low_price <= open_price
+           AND low_price <= close_price),
+    CONSTRAINT chk_volume_nonneg
+        CHECK (volume >= 0)
+);
+ 
+-- 1d. Derived metrics table
+CREATE TABLE IF NOT EXISTS daily_price_metrics (
+    metric_id       BIGSERIAL     PRIMARY KEY,
+    symbol_id       INTEGER       NOT NULL REFERENCES symbols(symbol_id) ON DELETE RESTRICT,
+    trade_date      DATE          NOT NULL,
+    daily_return_pct NUMERIC(8,4),   -- ((close - prev_close) / prev_close) * 100
+    price_range     NUMERIC(12,4),   -- high - low
+    range_pct       NUMERIC(8,4),    -- ((high - low) / low) * 100
+    vwap_approx     NUMERIC(12,4),   -- (high + low + close) / 3
+    sma_20d         NUMERIC(12,4),   -- 20-day simple moving average of close
+    computed_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+ 
+    CONSTRAINT uq_metrics_symbol_date UNIQUE (symbol_id, trade_date)
+);
+ 
+-- -------------------------
+-- 2. INDEXES
+-- -------------------------
+ 
+CREATE INDEX IF NOT EXISTS idx_dp_symbol_date
+    ON daily_prices (symbol_id, trade_date DESC);
+ 
+CREATE INDEX IF NOT EXISTS idx_dp_trade_date
+    ON daily_prices (trade_date);
+ 
+CREATE INDEX IF NOT EXISTS idx_dp_volume
+    ON daily_prices (volume);
+ 
+CREATE INDEX IF NOT EXISTS idx_symbols_ticker
+    ON symbols (ticker);
+ 
+CREATE INDEX IF NOT EXISTS idx_run_symbol
+    ON api_ingestion_runs (symbol_id, fetched_at DESC);
+ 
+-- -------------------------
+-- 3. SEED REFERENCE DATA
+-- -------------------------
+ 
+INSERT INTO symbols (ticker, company_name, exchange, currency)
+VALUES ('IBM', 'International Business Machines Corporation', 'NYSE', 'USD')
+ON CONFLICT (ticker) DO NOTHING;
+ 
+-- -------------------------
+-- 4. LOG THE INGESTION RUN
+-- -------------------------
+ 
+INSERT INTO api_ingestion_runs (symbol_id, source_url, status, notes)
+SELECT
+    symbol_id,
+    'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=IBM',
+    'success',
+    'Initial load from daily_IBM.csv — 100 trading days (2025-12-26 to 2026-05-20)'
+FROM symbols
+WHERE ticker = 'IBM';
+ 
+-- -------------------------
+-- 5. STAGING TABLE & LOAD
+-- -------------------------
+ 
+-- Temporary staging table mirrors the CSV structure exactly
+CREATE TEMP TABLE stg_ibm_prices (
+    timestamp   DATE,
+    open        NUMERIC(12,4),
+    high        NUMERIC(12,4),
+    low         NUMERIC(12,4),
+    close       NUMERIC(12,4),
+    volume      BIGINT
+);
+ 
+-- Load CSV into staging
+-- NOTE: If using psql interactively on your local machine, use \copy instead:
+--   \copy stg_ibm_prices FROM '/path/to/daily_IBM.csv' WITH (FORMAT csv, HEADER true);
+COPY stg_ibm_prices (timestamp, open, high, low, close, volume)
+FROM '/path/to/daily_IBM.csv'
+WITH (
+    FORMAT      csv,
+    HEADER      true,
+    DELIMITER   ',',
+    NULL        ''
+);
+ 
+-- -------------------------
+-- 6. INSERT FROM STAGING
+-- -------------------------
+ 
+INSERT INTO daily_prices (
+    symbol_id,
+    run_id,
+    trade_date,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    volume
+)
+SELECT
+    s.symbol_id,
+    r.run_id,
+    stg.timestamp,
+    stg.open,
+    stg.high,
+    stg.low,
+    stg.close,
+    stg.volume
+FROM stg_ibm_prices stg
+CROSS JOIN (SELECT symbol_id FROM symbols WHERE ticker = 'IBM') s
+CROSS JOIN (
+    SELECT run_id
+    FROM api_ingestion_runs
+    WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM')
+    ORDER BY fetched_at DESC
+    LIMIT 1
+) r
+ON CONFLICT (symbol_id, trade_date) DO NOTHING;  -- idempotent re-run safe
+ 
+-- Update run record count
+UPDATE api_ingestion_runs
+SET records_inserted = (
+    SELECT COUNT(*)
+    FROM daily_prices
+    WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM')
+)
+WHERE run_id = (
+    SELECT run_id FROM api_ingestion_runs
+    WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM')
+    ORDER BY fetched_at DESC LIMIT 1
+);
+ 
+-- Drop staging
+DROP TABLE stg_ibm_prices;
+ 
+-- -------------------------
+-- 7. COMPUTE DERIVED METRICS
+-- -------------------------
+ 
+INSERT INTO daily_price_metrics (
+    symbol_id,
+    trade_date,
+    daily_return_pct,
+    price_range,
+    range_pct,
+    vwap_approx,
+    sma_20d
+)
+SELECT
+    dp.symbol_id,
+    dp.trade_date,
+ 
+    -- Daily return vs prior close
+    ROUND(
+        (dp.close_price - LAG(dp.close_price) OVER w) /
+        NULLIF(LAG(dp.close_price) OVER w, 0) * 100,
+        4
+    ) AS daily_return_pct,
+ 
+    -- Intraday price range
+    ROUND(dp.high_price - dp.low_price, 4) AS price_range,
+ 
+    -- Range as % of low
+    ROUND((dp.high_price - dp.low_price) / NULLIF(dp.low_price, 0) * 100, 4) AS range_pct,
+ 
+    -- Simplified VWAP (HLC/3)
+    ROUND((dp.high_price + dp.low_price + dp.close_price) / 3, 4) AS vwap_approx,
+ 
+    -- 20-day simple moving average of closing price
+    ROUND(
+        AVG(dp.close_price) OVER (
+            PARTITION BY dp.symbol_id
+            ORDER BY dp.trade_date
+            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ),
+        4
+    ) AS sma_20d
+ 
+FROM daily_prices dp
+WHERE dp.symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM')
+WINDOW w AS (PARTITION BY dp.symbol_id ORDER BY dp.trade_date)
+ 
+ON CONFLICT (symbol_id, trade_date) DO UPDATE
+    SET daily_return_pct = EXCLUDED.daily_return_pct,
+        price_range      = EXCLUDED.price_range,
+        range_pct        = EXCLUDED.range_pct,
+        vwap_approx      = EXCLUDED.vwap_approx,
+        sma_20d          = EXCLUDED.sma_20d,
+        computed_at      = NOW();
+ 
+-- -------------------------
+-- 8. VERIFICATION QUERIES
+-- -------------------------
+ 
+-- Row counts
+SELECT 'symbols'             AS tbl, COUNT(*) AS rows FROM symbols
+UNION ALL
+SELECT 'api_ingestion_runs'  AS tbl, COUNT(*) AS rows FROM api_ingestion_runs
+UNION ALL
+SELECT 'daily_prices'        AS tbl, COUNT(*) AS rows FROM daily_prices
+UNION ALL
+SELECT 'daily_price_metrics' AS tbl, COUNT(*) AS rows FROM daily_price_metrics;
+ 
+-- Date range loaded
+SELECT
+    MIN(trade_date) AS earliest,
+    MAX(trade_date) AS latest,
+    COUNT(*)        AS trading_days
+FROM daily_prices
+WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM');
+ 
+-- Price summary
+SELECT
+    ROUND(MIN(low_price),  2) AS min_low,
+    ROUND(MAX(high_price), 2) AS max_high,
+    ROUND(AVG(close_price),2) AS avg_close,
+    SUM(volume)               AS total_volume
+FROM daily_prices
+WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM');
+ 
+-- Top 5 highest volume days
+SELECT trade_date, close_price, volume
+FROM daily_prices
+WHERE symbol_id = (SELECT symbol_id FROM symbols WHERE ticker = 'IBM')
+ORDER BY volume DESC
+LIMIT 5;
+ 
+-- -------------------------
+-- 9. COMMIT
+-- -------------------------
+COMMIT;
+ 
+-- =============================================================================
+-- END OF SCRIPT
