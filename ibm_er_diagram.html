@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IBM Stock DB — ER Diagram</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #f8f7f4;
+    margin: 0;
+    padding: 24px;
+    color: #2c2c2a;
+  }
+  h1 { font-size: 20px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { font-size: 13px; color: #5f5e5a; margin: 0 0 24px; }
+  #erd-container {
+    background: #fff;
+    border: 1px solid #d3d1c7;
+    border-radius: 12px;
+    padding: 32px;
+    overflow: auto;
+  }
+  #erd svg { max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>Entity–Relationship Diagram</h1>
+<p class="sub">IBM Daily Stock Prices — Alpha Vantage | PostgreSQL Schema</p>
+<div id="erd-container">
+  <div id="erd"></div>
+</div>
+
+<script type="module">
+import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+
+await document.fonts.ready;
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: 'system-ui, sans-serif',
+  themeVariables: {
+    darkMode: false,
+    fontSize: '13px',
+    fontFamily: 'system-ui, sans-serif',
+    lineColor: '#73726c',
+    textColor: '#3d3d3a',
+    primaryColor: '#e6f1fb',
+    primaryBorderColor: '#185fa5',
+    primaryTextColor: '#0c447c',
+    secondaryColor: '#e1f5ee',
+    tertiaryColor: '#faeeda',
+  },
+});
+
+const diagram = `erDiagram
+  symbols {
+    serial symbol_id PK
+    varchar ticker UK
+    varchar company_name
+    varchar exchange
+    char currency
+    timestamptz created_at
+  }
+  api_ingestion_runs {
+    serial run_id PK
+    integer symbol_id FK
+    timestamptz fetched_at
+    integer records_inserted
+    text source_url
+    varchar status
+    text notes
+  }
+  daily_prices {
+    bigserial price_id PK
+    integer symbol_id FK
+    integer run_id FK
+    date trade_date
+    numeric open_price
+    numeric high_price
+    numeric low_price
+    numeric close_price
+    bigint volume
+    timestamptz ingested_at
+  }
+  daily_price_metrics {
+    bigserial metric_id PK
+    integer symbol_id FK
+    date trade_date
+    numeric daily_return_pct
+    numeric price_range
+    numeric range_pct
+    numeric vwap_approx
+    numeric sma_20d
+    timestamptz computed_at
+  }
+
+  symbols ||--o{ api_ingestion_runs : "tracks"
+  symbols ||--o{ daily_prices : "has"
+  symbols ||--o{ daily_price_metrics : "has"
+  api_ingestion_runs ||--o{ daily_prices : "produces"
+`;
+
+const { svg } = await mermaid.render('erd-svg', diagram);
+document.getElementById('erd').innerHTML = svg;
+
+document.querySelectorAll('#erd svg .node').forEach(node => {
+  const firstPath = node.querySelector('path[d]');
+  if (!firstPath) return;
+  const d = firstPath.getAttribute('d');
+  const nums = d.match(/-?[\d.]+/g)?.map(Number);
+  if (!nums || nums.length < 8) return;
+  const xs = [nums[0], nums[2], nums[4], nums[6]];
+  const ys = [nums[1], nums[3], nums[5], nums[7]];
+  const x = Math.min(...xs), y = Math.min(...ys);
+  const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', y);
+  rect.setAttribute('width', w); rect.setAttribute('height', h);
+  rect.setAttribute('rx', '8');
+  for (const a of ['fill', 'stroke', 'stroke-width', 'class', 'style']) {
+    if (firstPath.hasAttribute(a)) rect.setAttribute(a, firstPath.getAttribute(a));
+  }
+  firstPath.replaceWith(rect);
+});
+
+document.querySelectorAll('#erd svg .row-rect-odd path, #erd svg .row-rect-even path').forEach(p => {
+  p.setAttribute('stroke', 'none');
+});
+</script>
+</body>
+</html>
